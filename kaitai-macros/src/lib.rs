@@ -51,7 +51,10 @@ pub fn kaitai_source(
     }
 
     // // Span::call_site() is a nightly feature.
-    let mut source_file_path = proc_macro::Span::call_site().source_file().path();
+    // Span::source_file() was removed; use Span::local_file() which returns Option<PathBuf>.
+    let mut source_file_path = proc_macro::Span::call_site()
+        .local_file()
+        .expect("kaitai_source: could not resolve call-site source file");
     source_file_path.pop();
     let file_path = source_file_path.join(Path::new(&ks_source_path.value()));
 
