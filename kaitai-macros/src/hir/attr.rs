@@ -206,7 +206,7 @@ impl Attribute {
             Logic::Type(ty) => ty.expr(endianness),
             Logic::Switch { .. } => todo!(),
             Logic::Size(size) => match size {
-                Size::Fixed(count) => quote! { buf.read_bytes(#count)? },
+                Size::Fixed(count) => quote! { buf.read_bytes((#count) as usize)? },
                 Size::Eos => quote! { buf.read_bytes_full()? },
             },
             Logic::Process(_) => todo!(),
