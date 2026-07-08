@@ -123,7 +123,7 @@ impl Attribute {
         let mut ty = match &self.logic {
             Logic::FixedContents(_) => return TokenStream::new(),
             Logic::Type(ty) => ty.ty(),
-            Logic::Switch { .. } => todo!(),
+            Logic::Switch { cases, .. } => unify_switch_cases(cases).to_token_stream(),
             Logic::Size(_) => quote! { ::std::vec::Vec<u8> },
             Logic::Process(_) => todo!(),
         };
@@ -204,7 +204,40 @@ impl Attribute {
                 return quote! { buf.ensure_fixed_contents(&[#(#contents),*])?; };
             }
             Logic::Type(ty) => ty.expr(endianness),
-            Logic::Switch { .. } => todo!(),
+            Logic::Switch { on, cases } => {
+                let on: TokenStream = on
+                    .parse()
+                    .expect("kaitai_source: invalid switch-on expression");
+                let unified = unify_switch_cases(cases);
+                let arms = cases.iter().map(|(pattern, ty)| {
+                    let bt = match ty {
+                        Type::BuiltIn { ty, en: None } => *ty,
+                        _ => panic!(
+                            "kaitai_source: switch-on codegen only supports built-in \
+                             integer case types"
+                        ),
+                    };
+                    let read = ty.expr(endianness);
+                    // Narrower cases are cast up to the unified type; a case that
+                    // already is the unified type is left as-is to avoid an
+                    // unnecessary-cast lint in the generated code.
+                    let read = if bt == unified {
+                        read
+                    } else {
+                        let unified = unified.to_token_stream();
+                        quote! { (#read as #unified) }
+                    };
+                    quote! { #pattern => #read }
+                });
+                quote! {
+                    match #on {
+                        #(#arms),*,
+                        _ => return ::std::result::Result::Err(
+                            ::kaitai::error::Error::NoEnumMatch
+                        ),
+                    }
+                }
+            }
             Logic::Size(size) => match size {
                 Size::Fixed(count) => quote! { buf.read_bytes((#count) as usize)? },
                 Size::Eos => quote! { buf.read_bytes_full()? },
@@ -266,10 +299,16 @@ impl TryFrom<(Option<de::meta::MetaDoc>, de::attr::Attr)> for Attribute {
                     de::attr::AttrType::Switch {
                         switch_on: on,
                         cases,
-                    } => Logic::Switch {
-                        on,
-                        cases: cases.into_iter().map(|(_k, _v)| todo!()).collect(),
-                    },
+                    } => {
+                        let mut cases: Vec<(Pattern, Type)> = cases
+                            .into_iter()
+                            .map(|(k, v)| (Pattern::from(k), Type::from((v, None))))
+                            .collect();
+                        // `cases` is sourced from a `HashMap`, whose iteration
+                        // order is nondeterministic; sort for stable codegen.
+                        cases.sort_by(|a, b| a.0.sort_key().cmp(&b.0.sort_key()));
+                        Logic::Switch { on, cases }
+                    }
                 }
             }
         };
@@ -354,7 +393,7 @@ impl From<(String, Option<String>)> for Type {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BuiltInType {
     U8,
     U16,
@@ -415,6 +454,45 @@ impl BuiltInType {
             _ => endianness.into(),
         }
     }
+
+    fn byte_width(self) -> u8 {
+        match self {
+            BuiltInType::U8 | BuiltInType::I8 => 1,
+            BuiltInType::U16 | BuiltInType::I16 => 2,
+            BuiltInType::U32 | BuiltInType::I32 | BuiltInType::F32 => 4,
+            BuiltInType::U64 | BuiltInType::I64 | BuiltInType::F64 => 8,
+        }
+    }
+
+    fn is_signed(self) -> bool {
+        matches!(
+            self,
+            BuiltInType::I8
+                | BuiltInType::I16
+                | BuiltInType::I32
+                | BuiltInType::I64
+                | BuiltInType::F32
+                | BuiltInType::F64
+        )
+    }
+
+    fn is_float(self) -> bool {
+        matches!(self, BuiltInType::F32 | BuiltInType::F64)
+    }
+
+    fn from_width_signed(width: u8, signed: bool) -> BuiltInType {
+        match (width, signed) {
+            (1, false) => BuiltInType::U8,
+            (2, false) => BuiltInType::U16,
+            (4, false) => BuiltInType::U32,
+            (8, false) => BuiltInType::U64,
+            (1, true) => BuiltInType::I8,
+            (2, true) => BuiltInType::I16,
+            (4, true) => BuiltInType::I32,
+            (8, true) => BuiltInType::I64,
+            _ => unreachable!("invalid integer width {width}"),
+        }
+    }
 }
 
 impl ToTokens for BuiltInType {
@@ -441,6 +519,78 @@ impl ToTokens for BuiltInType {
 pub enum Pattern {
     Enum(String),
     Int(u64),
+}
+
+impl From<String> for Pattern {
+    fn from(s: String) -> Self {
+        match s.parse::<u64>() {
+            Ok(n) => Pattern::Int(n),
+            Err(_) => Pattern::Enum(s),
+        }
+    }
+}
+
+impl Pattern {
+    /// Deterministic ordering key so switch cases sourced from a `HashMap`
+    /// produce stable codegen.
+    fn sort_key(&self) -> (u8, u64, &str) {
+        match self {
+            Pattern::Int(n) => (0, *n, ""),
+            Pattern::Enum(s) => (1, 0, s.as_str()),
+        }
+    }
+}
+
+impl ToTokens for Pattern {
+    fn to_tokens(&self, tokens: &mut TokenStream) {
+        match self {
+            Pattern::Int(n) => proc_macro2::Literal::u64_unsuffixed(*n).to_tokens(tokens),
+            Pattern::Enum(s) => {
+                // `enum_name::value` -> `EnumName::Value`
+                let path = s.split("::").map(sc_to_ucc).collect::<Vec<_>>().join("::");
+                let path: TokenStream = path
+                    .parse()
+                    .expect("kaitai_source: invalid enum pattern in switch case");
+                tokens.extend(path);
+            }
+        }
+    }
+}
+
+/// Computes the unified Rust type for a set of switch cases. Only built-in
+/// integer case types are supported; they are widened to the smallest type
+/// that fits every case (e.g. `u1` + `u2` -> `u16`).
+fn unify_switch_cases(cases: &[(Pattern, Type)]) -> BuiltInType {
+    let mut types = cases.iter().map(|(_, ty)| match ty {
+        Type::BuiltIn { ty, en: None } => *ty,
+        _ => panic!(
+            "kaitai_source: switch-on codegen only supports built-in integer case \
+             types (no user-defined types or enum-typed cases)"
+        ),
+    });
+    let mut unified = types
+        .next()
+        .expect("kaitai_source: switch-on must have at least one case");
+    for ty in types {
+        unified = widen(unified, ty);
+    }
+    unified
+}
+
+fn widen(a: BuiltInType, b: BuiltInType) -> BuiltInType {
+    if a == b {
+        return a;
+    }
+    if a.is_float() || b.is_float() {
+        panic!("kaitai_source: switch-on cannot unify differing float and integer case types");
+    }
+    if a.is_signed() != b.is_signed() {
+        panic!(
+            "kaitai_source: switch-on cannot unify signed and unsigned case types; \
+             make all cases the same signedness"
+        );
+    }
+    BuiltInType::from_width_signed(a.byte_width().max(b.byte_width()), a.is_signed())
 }
 
 #[derive(Clone, Debug)]

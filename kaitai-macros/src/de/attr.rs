@@ -113,8 +113,77 @@ pub enum AttrType {
     #[serde(rename_all = "kebab-case")]
     Switch {
         switch_on: String,
+        #[serde(deserialize_with = "deserialize_cases")]
         cases: HashMap<String, String>,
     },
+}
+
+/// A `switch-on` case key. Kaitai spells these unquoted (e.g. `1: u1`), so the
+/// YAML node may be an integer, a boolean, or a string (enum value); they are
+/// all normalized to a `String`.
+#[derive(PartialEq, Eq, Hash)]
+struct CaseKey(String);
+
+impl<'de> Deserialize<'de> for CaseKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct CaseKeyVisitor;
+
+        impl<'de> de::Visitor<'de> for CaseKeyVisitor {
+            type Value = CaseKey;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a switch case key (integer, string, or enum value)")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(CaseKey(value.to_owned()))
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(CaseKey(value))
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(CaseKey(value.to_string()))
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(CaseKey(value.to_string()))
+            }
+
+            fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(CaseKey(value.to_string()))
+            }
+        }
+
+        deserializer.deserialize_any(CaseKeyVisitor)
+    }
+}
+
+fn deserialize_cases<'de, D>(deserializer: D) -> Result<HashMap<String, String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = HashMap::<CaseKey, String>::deserialize(deserializer)?;
+    Ok(raw.into_iter().map(|(k, v)| (k.0, v)).collect())
 }
 
 #[derive(Clone, Debug, Deserialize)]
