@@ -250,7 +250,9 @@ impl Attribute {
                         ),
                     };
                     let read = ty.expr(endianness, bit_endianness, root_dep_map);
-                    let read = if all_bool || bt == unified {
+                    // Cast narrower case values to the unified type regardless
+                    // of whether the discriminant is bool or an integer.
+                    let read = if bt == unified {
                         read
                     } else {
                         let unified = unified.to_token_stream();
