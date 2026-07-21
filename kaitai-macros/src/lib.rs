@@ -63,6 +63,7 @@ pub fn kaitai_source(
     let inherited_meta = hir::ty::InheritedMeta {
         id: Some((struct_item.ident, true)),
         endianness: None,
+        bit_endianness: None,
     };
 
     let ty: hir::ty::Type = (inherited_meta, de_type).try_into().unwrap();

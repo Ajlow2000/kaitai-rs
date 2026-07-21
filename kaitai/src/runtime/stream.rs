@@ -187,6 +187,27 @@ pub trait KaitaiStream: Read + Seek {
         self.read_i8().map_err(|e| e.into())
     }
 
+    /// Reads `n` bits from the stream in big-endian bit order, using the
+    /// caller-managed accumulator `bits`/`bits_left` shared across consecutive
+    /// bit-field reads within the same byte boundary.
+    fn read_bits_be(&mut self, n: u8, bits: &mut u64, bits_left: &mut u8) -> Result<u64> {
+        use byteorder::ReadBytesExt;
+        while *bits_left < n {
+            let byte = self.read_u8().map_err(Error::from)?;
+            *bits = (*bits << 8) | (byte as u64);
+            *bits_left += 8;
+        }
+        *bits_left -= n;
+        let mask = if n == 64 { u64::MAX } else { (1u64 << n) - 1 };
+        Ok((*bits >> *bits_left) & mask)
+    }
+
+    /// Discards any partially-consumed bits from the accumulator, re-aligning
+    /// to the next byte boundary before resuming byte-level reads.
+    fn align_to_byte(&mut self, bits_left: &mut u8) {
+        *bits_left = 0;
+    }
+
     generate_read_functions!(u; [2, 4, 8] => [u16, u32, u64]);
     generate_read_functions!(s; [2, 4, 8] => [i16, i32, i64]);
     generate_read_functions!(f; [4, 8] => [f32, f64]);

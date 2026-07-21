@@ -6,11 +6,30 @@ use crate::{
 
 use proc_macro2::{Ident, Span, TokenStream};
 use quote::{quote, ToTokens};
+use std::collections::HashMap;
 
 pub use crate::de::data::IntegerValue;
 
+/// Extra information about a `_root.X.Y` dependency discovered in a sub-type's
+/// switch-on expressions. Used by the parent type to generate `new_with_root`
+/// calls instead of the standard `KaitaiStruct::new` calls.
 #[derive(Clone, Debug)]
-pub struct Attributes(Vec<Attribute>);
+pub struct RootParam {
+    /// The full `_root.…` path string as it appears in the YAML switch-on.
+    pub path: String,
+    /// Sanitised parameter identifier: `_root.flags.timestamps_64bit` →
+    /// `root_flags_timestamps_64bit`.
+    pub param_ident: Ident,
+    /// Rust type of the parameter, derived from the switch case patterns
+    /// (e.g. `bool` when cases are `true`/`false`, a widened int otherwise).
+    pub param_ty: TokenStream,
+    /// Expression that produces the value in the *parent* type's `new()` scope
+    /// (e.g. `flags.timestamps_64bit`).
+    pub accessor: TokenStream,
+}
+
+#[derive(Clone, Debug)]
+pub struct Attributes(pub(crate) Vec<Attribute>);
 
 impl TryFrom<(Option<de::meta::MetaDoc>, Vec<de::attr::Attr>)> for Attributes {
     type Error = ();
@@ -35,13 +54,104 @@ impl Attributes {
             .map(|a| a.field_definition())
     }
 
+    /// Returns `true` if any attribute in the sequence is a bit-width field.
+    pub fn has_bit_fields(&self) -> bool {
+        self.0.iter().any(|a| a.is_bit_field())
+    }
+
+    /// Collects all `_root.X.Y` switch-on references in this attribute list.
+    /// Deduplicates by path so each unique dependency appears only once.
+    pub fn root_refs(&self) -> Vec<RootParam> {
+        let mut seen = std::collections::HashSet::new();
+        let mut result = Vec::new();
+        for attr in &self.0 {
+            if let Logic::Switch { on, cases } = &attr.logic {
+                if on.starts_with("_root.") && seen.insert(on.clone()) {
+                    let path_without_root = &on["_root.".len()..];
+                    let param_name =
+                        format!("root_{}", path_without_root.replace('.', "_"));
+                    let param_ident = Ident::new(&param_name, Span::call_site());
+                    let param_ty = discriminant_type_from_cases(cases);
+                    let accessor: TokenStream = path_without_root
+                        .parse()
+                        .expect("kaitai_source: invalid _root ref path");
+                    result.push(RootParam {
+                        path: on.clone(),
+                        param_ident,
+                        param_ty,
+                        accessor,
+                    });
+                }
+            }
+        }
+        result
+    }
+
+    /// Generates variable-assignment statements for the normal `new()` body.
+    ///
+    /// * Inserts `buf.align_to_byte(&mut _bits_left)` whenever the sequence
+    ///   transitions from a bit-field run back to byte-level reads.
+    /// * Substitutes `TypeName::new_with_root(buf, …)` for any `UserDefined`
+    ///   type that appears in `root_dep_map`.
     pub fn variable_assignments(
         &self,
         endianness: Endianness,
-    ) -> impl Iterator<Item = TokenStream> + '_ {
-        self.0
-            .iter()
-            .map(move |a| a.variable_assignment(endianness))
+        bit_endianness: Endianness,
+        root_dep_map: &HashMap<String, Vec<RootParam>>,
+    ) -> Vec<TokenStream> {
+        let empty_rewrite = HashMap::new();
+        let mut result = Vec::new();
+        let mut in_bit_run = false;
+
+        for attr in &self.0 {
+            let is_bit = attr.is_bit_field();
+            if in_bit_run && !is_bit {
+                result.push(quote! { buf.align_to_byte(&mut _bits_left) });
+                in_bit_run = false;
+            }
+            if is_bit {
+                in_bit_run = true;
+            }
+            result.push(attr.variable_assignment(
+                endianness,
+                bit_endianness,
+                root_dep_map,
+                &empty_rewrite,
+            ));
+        }
+        result
+    }
+
+    /// Generates variable-assignment statements for a `new_with_root()` body,
+    /// rewriting `_root.X.Y` switch-on expressions to the corresponding
+    /// parameter identifier.
+    pub fn variable_assignments_with_root_rewrite(
+        &self,
+        endianness: Endianness,
+        bit_endianness: Endianness,
+        root_rewrite: &HashMap<String, Ident>,
+    ) -> Vec<TokenStream> {
+        let empty_root_dep: HashMap<String, Vec<RootParam>> = HashMap::new();
+        let mut result = Vec::new();
+        let mut in_bit_run = false;
+
+        for attr in &self.0 {
+            let is_bit = attr.is_bit_field();
+            if in_bit_run && !is_bit {
+                result.push(quote! { buf.align_to_byte(&mut _bits_left) });
+                in_bit_run = false;
+            }
+            if is_bit {
+                in_bit_run = true;
+            }
+            result.push(attr.variable_assignment(
+                endianness,
+                bit_endianness,
+                &empty_root_dep,
+                root_rewrite,
+            ));
+        }
+        result
     }
 
     pub fn field_assignments(&self) -> impl Iterator<Item = &Ident> {
@@ -51,7 +161,7 @@ impl Attributes {
 
 #[derive(Clone, Debug)]
 pub struct Attribute {
-    id: Ident,
+    pub id: Ident,
     doc: Doc,
     repeat: Option<Repeat>,
     logic: Logic,
@@ -64,61 +174,21 @@ impl Attribute {
             Logic::Type(_) => true,
             Logic::Switch { .. } => true,
             Logic::Size(_) => true,
-            Logic::Process(_) => true,
+            Logic::Process(_) => todo!(),
         }
     }
 
-    /// Returns a [`TokenStream`] containing the definition of the struct field
-    /// containing the `Attribute`.
-    ///
-    /// # Examples
-    ///
-    /// ## Built-in
-    ///
-    /// ```yaml
-    /// name: example_attr
-    /// type: u4
-    /// ```
-    /// results in
-    /// ```ignore
-    /// pub example_attr: u32
-    /// ```
-    ///
-    /// Note that a `u4` in KS is the equivalent of a [`u32`] in Rust.
-    ///
-    /// ## Custom type
-    ///
-    /// ```yaml
-    /// name: example_attr
-    /// type: example_type
-    /// ## where example_type is a custom type defined in the `types` part of the file.
-    /// ```
-    /// results in
-    /// ```ignore
-    /// pub example_attr: ExampleType
-    /// ```
-    ///
-    /// Note that the name of the type is converted into upper camel case.
-    ///
-    /// ## Enum
-    ///
-    /// ```yaml
-    /// name: example_attr
-    /// type: example_enum
-    /// ## where example_enum is an enum defined in the `enums` part of the file.
-    /// ```
-    /// results in
-    /// ```ignore
-    /// pub example_attr: ExampleEnum
-    /// ```
-    ///
-    /// Note that the name of the enum is converted into upper camel case.
-    ///
-    /// ## Fixed Contents
-    ///
-    /// Fixed contents attributes are only checked and are not stored in the struct.
-    /// Hence, this method return an empty [`TokenStream`] if the attribute has fixed
-    /// contents.
+    /// Returns `true` if this attribute reads a bit-width field (`b1`–`b64`).
+    pub fn is_bit_field(&self) -> bool {
+        matches!(
+            &self.logic,
+            Logic::Type(Type::BuiltIn {
+                ty: BuiltInType::Bits(_),
+                ..
+            })
+        )
+    }
+
     pub fn field_definition(&self) -> TokenStream {
         let mut ty = match &self.logic {
             Logic::FixedContents(_) => return TokenStream::new(),
@@ -139,76 +209,38 @@ impl Attribute {
         }
     }
 
-    /// Returns a [`TokenStream`] representing the assignment of the variable
-    /// containing the `Attribute`.
+    /// Generates the `let <id> = …;` statement for this attribute.
     ///
-    /// # Examples
-    /// All the following examples assume the format is little endian.
+    /// `root_dep_map` maps a sub-type name to the `_root` params that must be
+    /// forwarded via `TypeName::new_with_root(buf, …)`.
     ///
-    /// ## Built-in
-    ///
-    /// ```yaml
-    /// name: example_attr
-    /// type: u4
-    /// ```
-    /// results in
-    /// ```ignore
-    /// let example_attr = buf.read_u4le()?;
-    /// ```
-    ///
-    /// ## Custom type
-    ///
-    /// ```yaml
-    /// name: example_attr
-    /// type: example_type
-    /// ## where example_type is a custom type defined in the `types` part of the file.
-    /// ```
-    /// results in
-    /// ```ignore
-    /// let example_attr = ExampleType::new(buf)?;
-    /// ```
-    ///
-    /// Note that the name of the type is converted into upper camel case.
-    ///
-    /// ## Enum
-    ///
-    /// ```yaml
-    /// name: example_attr
-    /// type: example_enum
-    /// ## where example_enum is an enum defined in the `enums` part of the file.
-    /// ```
-    /// results in
-    /// ```ignore
-    /// let example_attr = ExampleEnum::n(buf.read_u4le()?).ok_or(::kaitai::error::Error::NoEnumMatch)?;
-    /// ```
-    ///
-    /// Note that the name of the enum is converted into upper camel case.
-    ///
-    /// ## Fixed Contents
-    ///
-    /// Fixed contents attributes are only checked and are not stored in the struct.
-    ///
-    /// ```yaml
-    /// name: id
-    /// contents: glTF
-    /// ```
-    /// results is
-    /// ```ignore
-    /// buf.ensure_fixed_contents("glTF".as_bytes())?;
-    /// ```
-    ///
-    pub fn variable_assignment(&self, endianness: Endianness) -> TokenStream {
+    /// `root_rewrite` maps a `_root.X.Y` string to the local parameter ident
+    /// that should replace it in a `new_with_root` body.
+    pub fn variable_assignment(
+        &self,
+        endianness: Endianness,
+        bit_endianness: Endianness,
+        root_dep_map: &HashMap<String, Vec<RootParam>>,
+        root_rewrite: &HashMap<String, Ident>,
+    ) -> TokenStream {
         let mut expr = match &self.logic {
             Logic::FixedContents(c) => {
                 let contents = c.iter().map(|i| quote! { #i });
                 return quote! { buf.ensure_fixed_contents(&[#(#contents),*])?; };
             }
-            Logic::Type(ty) => ty.expr(endianness),
+            Logic::Type(ty) => ty.expr(endianness, bit_endianness, root_dep_map),
             Logic::Switch { on, cases } => {
-                let on: TokenStream = on
-                    .parse()
-                    .expect("kaitai_source: invalid switch-on expression");
+                // If we're inside a `new_with_root` body, rewrite `_root.*` refs.
+                let on_tokens: TokenStream = if let Some(rewrite_ident) = root_rewrite.get(on) {
+                    rewrite_ident.to_token_stream()
+                } else {
+                    on.parse()
+                        .expect("kaitai_source: invalid switch-on expression")
+                };
+
                 let unified = unify_switch_cases(cases);
+                let all_bool = cases.iter().all(|(p, _)| matches!(p, Pattern::Bool(_)));
+
                 let arms = cases.iter().map(|(pattern, ty)| {
                     let bt = match ty {
                         Type::BuiltIn { ty, en: None } => *ty,
@@ -217,11 +249,8 @@ impl Attribute {
                              integer case types"
                         ),
                     };
-                    let read = ty.expr(endianness);
-                    // Narrower cases are cast up to the unified type; a case that
-                    // already is the unified type is left as-is to avoid an
-                    // unnecessary-cast lint in the generated code.
-                    let read = if bt == unified {
+                    let read = ty.expr(endianness, bit_endianness, root_dep_map);
+                    let read = if all_bool || bt == unified {
                         read
                     } else {
                         let unified = unified.to_token_stream();
@@ -229,12 +258,21 @@ impl Attribute {
                     };
                     quote! { #pattern => #read }
                 });
-                quote! {
-                    match #on {
-                        #(#arms),*,
-                        _ => return ::std::result::Result::Err(
-                            ::kaitai::error::Error::NoEnumMatch
-                        ),
+
+                if all_bool {
+                    quote! {
+                        match #on_tokens {
+                            #(#arms),*
+                        }
+                    }
+                } else {
+                    quote! {
+                        match #on_tokens {
+                            #(#arms),*,
+                            _ => return ::std::result::Result::Err(
+                                ::kaitai::error::Error::NoEnumMatch
+                            ),
+                        }
                     }
                 }
             }
@@ -348,7 +386,7 @@ pub enum Type {
 }
 
 impl Type {
-    fn ty(&self) -> TokenStream {
+    pub fn ty(&self) -> TokenStream {
         match self {
             Type::UserDefined(id) => id.into_token_stream(),
             Type::BuiltIn { ty, en } => {
@@ -361,9 +399,33 @@ impl Type {
         }
     }
 
-    fn expr(&self, endianness: Endianness) -> TokenStream {
+    pub fn expr(
+        &self,
+        endianness: Endianness,
+        bit_endianness: Endianness,
+        root_dep_map: &HashMap<String, Vec<RootParam>>,
+    ) -> TokenStream {
         match self {
-            Type::UserDefined(id) => quote! { <#id as ::kaitai::KaitaiStruct>::new(buf)? },
+            Type::UserDefined(id) => {
+                if let Some(params) = root_dep_map.get(&id.to_string()) {
+                    let accessors = params.iter().map(|p| &p.accessor);
+                    quote! { #id::new_with_root(buf, #(#accessors),*)? }
+                } else {
+                    quote! { <#id as ::kaitai::KaitaiStruct>::new(buf)? }
+                }
+            }
+            Type::BuiltIn {
+                ty: BuiltInType::Bits(n),
+                en: _,
+            } => {
+                let _ = bit_endianness; // currently only be is implemented
+                if *n == 1 {
+                    quote! { (buf.read_bits_be(#n, &mut _bits, &mut _bits_left)? != 0) }
+                } else {
+                    let rust_ty = BuiltInType::Bits(*n).to_token_stream();
+                    quote! { (buf.read_bits_be(#n, &mut _bits, &mut _bits_left)? as #rust_ty) }
+                }
+            }
             Type::BuiltIn { ty, en } => {
                 let read_call =
                     format!("buf.read_{}{}()?", ty.ks_type(), ty.endianness(endianness))
@@ -405,6 +467,9 @@ pub enum BuiltInType {
     I64,
     F32,
     F64,
+    /// A bit-width field: `b1`–`b64`. Maps to `bool` for `b1`, widened
+    /// unsigned integer for larger widths.
+    Bits(u8),
 }
 
 impl TryFrom<&str> for BuiltInType {
@@ -422,7 +487,16 @@ impl TryFrom<&str> for BuiltInType {
             "s8" => BuiltInType::I64,
             "f4" => BuiltInType::F32,
             "f8" => BuiltInType::F64,
-            _ => return Err(()),
+            _ => {
+                if let Some(n_str) = s.strip_prefix('b') {
+                    if let Ok(n) = n_str.parse::<u8>() {
+                        if n >= 1 {
+                            return Ok(BuiltInType::Bits(n));
+                        }
+                    }
+                }
+                return Err(());
+            }
         })
     }
 }
@@ -440,17 +514,16 @@ impl BuiltInType {
             BuiltInType::I64 => "s8",
             BuiltInType::F32 => "f4",
             BuiltInType::F64 => "f8",
+            BuiltInType::Bits(_) => {
+                unreachable!("ks_type not applicable to bit fields; handled in Type::expr")
+            }
         }
     }
 
-    /// Returns a [`String`] describing the endianness of the `VariableContents`.
-    ///
-    /// Little-endian contents return "le". Big-endian contents return "be".
-    ///
-    /// If the contents are of KS type `u1` or `s1`, the function will return an empty string.
     fn endianness(&self, endianness: Endianness) -> &'static str {
         match &self {
             BuiltInType::U8 | BuiltInType::I8 => "",
+            BuiltInType::Bits(_) => "",
             _ => endianness.into(),
         }
     }
@@ -461,6 +534,7 @@ impl BuiltInType {
             BuiltInType::U16 | BuiltInType::I16 => 2,
             BuiltInType::U32 | BuiltInType::I32 | BuiltInType::F32 => 4,
             BuiltInType::U64 | BuiltInType::I64 | BuiltInType::F64 => 8,
+            BuiltInType::Bits(n) => (n + 7) / 8,
         }
     }
 
@@ -508,6 +582,11 @@ impl ToTokens for BuiltInType {
             BuiltInType::I64 => quote! { i64 },
             BuiltInType::F32 => quote! { f32 },
             BuiltInType::F64 => quote! { f64 },
+            BuiltInType::Bits(1) => quote! { bool },
+            BuiltInType::Bits(n) if *n <= 8 => quote! { u8 },
+            BuiltInType::Bits(n) if *n <= 16 => quote! { u16 },
+            BuiltInType::Bits(n) if *n <= 32 => quote! { u32 },
+            BuiltInType::Bits(_) => quote! { u64 },
         })
     }
 }
@@ -519,10 +598,17 @@ impl ToTokens for BuiltInType {
 pub enum Pattern {
     Enum(String),
     Int(u64),
+    Bool(bool),
 }
 
 impl From<String> for Pattern {
     fn from(s: String) -> Self {
+        if s == "true" {
+            return Pattern::Bool(true);
+        }
+        if s == "false" {
+            return Pattern::Bool(false);
+        }
         match s.parse::<u64>() {
             Ok(n) => Pattern::Int(n),
             Err(_) => Pattern::Enum(s),
@@ -531,12 +617,11 @@ impl From<String> for Pattern {
 }
 
 impl Pattern {
-    /// Deterministic ordering key so switch cases sourced from a `HashMap`
-    /// produce stable codegen.
     fn sort_key(&self) -> (u8, u64, &str) {
         match self {
             Pattern::Int(n) => (0, *n, ""),
-            Pattern::Enum(s) => (1, 0, s.as_str()),
+            Pattern::Bool(b) => (1, if *b { 1 } else { 0 }, ""),
+            Pattern::Enum(s) => (2, 0, s.as_str()),
         }
     }
 }
@@ -545,6 +630,10 @@ impl ToTokens for Pattern {
     fn to_tokens(&self, tokens: &mut TokenStream) {
         match self {
             Pattern::Int(n) => proc_macro2::Literal::u64_unsuffixed(*n).to_tokens(tokens),
+            Pattern::Bool(b) => {
+                let t: TokenStream = if *b { quote! { true } } else { quote! { false } };
+                tokens.extend(t);
+            }
             Pattern::Enum(s) => {
                 // `enum_name::value` -> `EnumName::Value`
                 let path = s.split("::").map(sc_to_ucc).collect::<Vec<_>>().join("::");
@@ -554,6 +643,16 @@ impl ToTokens for Pattern {
                 tokens.extend(path);
             }
         }
+    }
+}
+
+/// Derives the Rust discriminant type required by a set of switch cases.
+/// Bool-pattern cases → `bool`; integer-pattern cases → widened integer type.
+fn discriminant_type_from_cases(cases: &[(Pattern, Type)]) -> TokenStream {
+    if cases.iter().all(|(p, _)| matches!(p, Pattern::Bool(_))) {
+        quote! { bool }
+    } else {
+        unify_switch_cases(cases).to_token_stream()
     }
 }
 
@@ -580,6 +679,9 @@ fn unify_switch_cases(cases: &[(Pattern, Type)]) -> BuiltInType {
 fn widen(a: BuiltInType, b: BuiltInType) -> BuiltInType {
     if a == b {
         return a;
+    }
+    if matches!(a, BuiltInType::Bits(_)) || matches!(b, BuiltInType::Bits(_)) {
+        panic!("kaitai_source: bit types cannot be used as switch-on case types");
     }
     if a.is_float() || b.is_float() {
         panic!("kaitai_source: switch-on cannot unify differing float and integer case types");

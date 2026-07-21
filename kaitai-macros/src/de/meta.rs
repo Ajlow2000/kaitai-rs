@@ -15,6 +15,8 @@ pub struct Meta {
     pub encoding: Option<String>,
     #[serde(rename = "endian")]
     pub endianness: Option<Endianness>,
+    #[serde(rename = "bit-endian")]
+    pub bit_endian: Option<Endianness>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
